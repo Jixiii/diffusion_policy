@@ -71,12 +71,15 @@ class RealEnv:
         replay_buffer = ReplayBuffer.create_from_path(
             zarr_path=zarr_path, mode='a')
 
+        # 启动共享内存管理器
         if shm_manager is None:
             shm_manager = SharedMemoryManager()
             shm_manager.start()
+        # 获取所有连接的相机序列号
         if camera_serial_numbers is None:
             camera_serial_numbers = SingleRealsense.get_connected_devices_serial()
 
+        # 图像变换函数（用于相机采集到的图像预处理）
         color_tf = get_image_transform(
             input_res=video_capture_resolution,
             output_res=obs_image_resolution, 
@@ -90,6 +93,7 @@ class RealEnv:
             data['color'] = color_transform(data['color'])
             return data
         
+        # 计算多相机可视化窗口的布局
         rw, rh, col, row = optimal_row_cols(
             n_cameras=len(camera_serial_numbers),
             in_wh_ratio=obs_image_resolution[0]/obs_image_resolution[1],
@@ -104,6 +108,7 @@ class RealEnv:
             data['color'] = vis_color_transform(data['color'])
             return data
 
+        # 视频录制参数设置
         recording_transfrom = None
         recording_fps = video_capture_fps
         recording_pix_fmt = 'bgr24'
@@ -112,6 +117,7 @@ class RealEnv:
             recording_fps = frequency
             recording_pix_fmt = 'rgb24'
 
+        # 创建视频录制器
         video_recorder = VideoRecorder.create_h264(
             fps=recording_fps, 
             codec='h264',
@@ -120,6 +126,7 @@ class RealEnv:
             thread_type='FRAME',
             thread_count=thread_per_video)
 
+        # 初始化多相机采集对象
         realsense = MultiRealsense(
             serial_numbers=camera_serial_numbers,
             shm_manager=shm_manager,
@@ -141,6 +148,7 @@ class RealEnv:
             verbose=False
             )
         
+        # 多相机可视化窗口
         multi_cam_vis = None
         if enable_multi_cam_vis:
             multi_cam_vis = MultiCameraVisualizer(
@@ -150,11 +158,13 @@ class RealEnv:
                 rgb_to_bgr=False
             )
 
+        # 机器人初始关节配置
         cube_diag = np.linalg.norm([1,1,1])
         j_init = np.array([0,-90,-90,-90,90,0]) / 180 * np.pi
         if not init_joints:
             j_init = None
 
+        # 初始化机器人控制器
         robot = RTDEInterpolationController(
             shm_manager=shm_manager,
             robot_ip=robot_ip,
@@ -174,9 +184,9 @@ class RealEnv:
             receive_keys=None,
             get_max_k=max_obs_buffer_size
             )
-        self.realsense = realsense
-        self.robot = robot
-        self.multi_cam_vis = multi_cam_vis
+        self.realsense = realsense  # 多相机采集对象
+        self.robot = robot          # 机器人控制对象
+        self.multi_cam_vis = multi_cam_vis  # 多相机可视化
         self.video_capture_fps = video_capture_fps
         self.frequency = frequency
         self.n_obs_steps = n_obs_steps
@@ -187,22 +197,24 @@ class RealEnv:
         # recording
         self.output_dir = output_dir
         self.video_dir = video_dir
-        self.replay_buffer = replay_buffer
+        self.replay_buffer = replay_buffer  # 采集数据缓冲区
         # temp memory buffers
         self.last_realsense_data = None
         # recording buffers
-        self.obs_accumulator = None
-        self.action_accumulator = None
-        self.stage_accumulator = None
+        self.obs_accumulator = None         # 观测累加器
+        self.action_accumulator = None      # 动作累加器
+        self.stage_accumulator = None       # 阶段累加器
 
         self.start_time = None
     
     # ======== start-stop API =============
     @property
     def is_ready(self):
+        # 检查相机和机器人是否都已准备好
         return self.realsense.is_ready and self.robot.is_ready
     
     def start(self, wait=True):
+        # 启动相机、机器人和多相机可视化（如有）
         self.realsense.start(wait=False)
         self.robot.start(wait=False)
         if self.multi_cam_vis is not None:
@@ -211,6 +223,7 @@ class RealEnv:
             self.start_wait()
 
     def stop(self, wait=True):
+        # 停止采集，结束当前episode，关闭可视化、机器人和相机
         self.end_episode()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.stop(wait=False)
@@ -220,12 +233,14 @@ class RealEnv:
             self.stop_wait()
 
     def start_wait(self):
+        # 等待所有硬件和可视化准备就绪
         self.realsense.start_wait()
         self.robot.start_wait()
         if self.multi_cam_vis is not None:
             self.multi_cam_vis.start_wait()
     
     def stop_wait(self):
+        # 等待所有硬件和可视化完全停止
         self.robot.stop_wait()
         self.realsense.stop_wait()
         if self.multi_cam_vis is not None:
@@ -233,10 +248,12 @@ class RealEnv:
 
     # ========= context manager ===========
     def __enter__(self):
+        # 支持with语法自动启动
         self.start()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # 支持with语法自动关闭
         self.stop()
 
     # ========= async env API ===========
@@ -244,18 +261,18 @@ class RealEnv:
         "observation dict"
         assert self.is_ready
 
-        # get data
-        # 30 Hz, camera_receive_timestamp
+        # 获取相机观测数据（30Hz），camera_receive_timestamp
+        # k为每次需要获取的观测帧数，保证覆盖n_obs_steps
         k = math.ceil(self.n_obs_steps * (self.video_capture_fps / self.frequency))
         self.last_realsense_data = self.realsense.get(
             k=k, 
             out=self.last_realsense_data)
 
-        # 125 hz, robot_receive_timestamp
+        # 获取机器人观测数据（125Hz），robot_receive_timestamp
         last_robot_data = self.robot.get_all_state()
         # both have more than n_obs_steps data
 
-        # align camera obs timestamps
+        # 对齐相机观测的时间戳，使相机和机器人观测同步
         dt = 1 / self.frequency
         last_timestamp = np.max([x['timestamp'][-1] for x in self.last_realsense_data.values()])
         obs_align_timestamps = last_timestamp - (np.arange(self.n_obs_steps)[::-1] * dt)
@@ -273,7 +290,7 @@ class RealEnv:
             # remap key
             camera_obs[f'camera_{camera_idx}'] = value['color'][this_idxs]
 
-        # align robot obs
+        # 对齐机器人观测
         robot_timestamps = last_robot_data['robot_receive_timestamp']
         this_timestamps = robot_timestamps
         this_idxs = list()
@@ -293,14 +310,14 @@ class RealEnv:
         for k, v in robot_obs_raw.items():
             robot_obs[k] = v[this_idxs]
 
-        # accumulate obs
+        # 如果正在录制，则累加观测数据到观测累加器
         if self.obs_accumulator is not None:
             self.obs_accumulator.put(
                 robot_obs_raw,
                 robot_timestamps
             )
 
-        # return obs
+        # 返回观测数据（相机+机器人+对齐后的时间戳）
         obs_data = dict(camera_obs)
         obs_data.update(robot_obs)
         obs_data['timestamp'] = obs_align_timestamps
@@ -320,21 +337,21 @@ class RealEnv:
         elif not isinstance(stages, np.ndarray):
             stages = np.array(stages, dtype=np.int64)
 
-        # convert action to pose
+        # 将动作转换为末端位姿
         receive_time = time.time()
         is_new = timestamps > receive_time
         new_actions = actions[is_new]
         new_timestamps = timestamps[is_new]
         new_stages = stages[is_new]
 
-        # schedule waypoints
+        # 安排机器人轨迹点
         for i in range(len(new_actions)):
             self.robot.schedule_waypoint(
                 pose=new_actions[i],
                 target_time=new_timestamps[i]
             )
         
-        # record actions
+        # 如果正在录制，则累加动作数据
         if self.action_accumulator is not None:
             self.action_accumulator.put(
                 new_actions,
@@ -358,7 +375,7 @@ class RealEnv:
 
         assert self.is_ready
 
-        # prepare recording stuff
+        # 为新episode准备录制相关内容
         episode_id = self.replay_buffer.n_episodes
         this_video_dir = self.video_dir.joinpath(str(episode_id))
         this_video_dir.mkdir(parents=True, exist_ok=True)
@@ -368,11 +385,11 @@ class RealEnv:
             video_paths.append(
                 str(this_video_dir.joinpath(f'{i}.mp4').absolute()))
         
-        # start recording on realsense
+        # 启动realsense录制
         self.realsense.restart_put(start_time=start_time)
         self.realsense.start_recording(video_path=video_paths, start_time=start_time)
 
-        # create accumulators
+        # 创建观测、动作、阶段累加器
         self.obs_accumulator = TimestampObsAccumulator(
             start_time=start_time,
             dt=1/self.frequency
@@ -391,7 +408,7 @@ class RealEnv:
         "Stop recording"
         assert self.is_ready
         
-        # stop video recorder
+        # 停止视频录制
         self.realsense.stop_recording()
 
         if self.obs_accumulator is not None:
@@ -399,9 +416,7 @@ class RealEnv:
             assert self.action_accumulator is not None
             assert self.stage_accumulator is not None
 
-            # Since the only way to accumulate obs and action is by calling
-            # get_obs and exec_actions, which will be in the same thread.
-            # We don't need to worry new data come in here.
+            # 由于get_obs和exec_actions都在同一线程调用，不会有新数据竞争
             obs_data = self.obs_accumulator.data
             obs_timestamps = self.obs_accumulator.timestamps
 
@@ -416,6 +431,7 @@ class RealEnv:
                 episode['stage'] = stages[:n_steps]
                 for key, value in obs_data.items():
                     episode[key] = value[:n_steps]
+                # 保存本次episode到replay_buffer
                 self.replay_buffer.add_episode(episode, compressors='disk')
                 episode_id = self.replay_buffer.n_episodes - 1
                 print(f'Episode {episode_id} saved!')
@@ -431,5 +447,4 @@ class RealEnv:
         this_video_dir = self.video_dir.joinpath(str(episode_id))
         if this_video_dir.exists():
             shutil.rmtree(str(this_video_dir))
-        print(f'Episode {episode_id} dropped!')
 

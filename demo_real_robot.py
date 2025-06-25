@@ -38,29 +38,31 @@ from diffusion_policy.real_world.keystroke_counter import (
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_latency):
     dt = 1/frequency
+    # 启动共享内存管理器
     with SharedMemoryManager() as shm_manager:
+        # 初始化按键监听器、SpaceMouse和真实环境
         with KeystrokeCounter() as key_counter, \
             Spacemouse(shm_manager=shm_manager) as sm, \
             RealEnv(
                 output_dir=output, 
                 robot_ip=robot_ip, 
-                # recording resolution
+                # 观测图像分辨率
                 obs_image_resolution=(1280,720),
                 frequency=frequency,
                 init_joints=init_joints,
                 enable_multi_cam_vis=True,
                 record_raw_video=True,
-                # number of threads per camera view for video recording (H.264)
+                # 每个摄像头用于视频录制的线程数
                 thread_per_video=3,
-                # video recording quality, lower is better (but slower).
+                # 视频录制质量，数值越低质量越好（但速度越慢）
                 video_crf=21,
                 shm_manager=shm_manager
             ) as env:
             cv2.setNumThreads(1)
 
-            # realsense exposure
+            # 设置RealSense相机曝光
             env.realsense.set_exposure(exposure=120, gain=0)
-            # realsense white balance
+            # 设置RealSense相机白平衡
             env.realsense.set_white_balance(white_balance=5900)
 
             time.sleep(1.0)
@@ -72,34 +74,34 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
             stop = False
             is_recording = False
             while not stop:
-                # calculate timing
+                # 计算本周期结束时间
                 t_cycle_end = t_start + (iter_idx + 1) * dt
                 t_sample = t_cycle_end - command_latency
                 t_command_target = t_cycle_end + dt
 
-                # pump obs
+                # 获取观测数据
                 obs = env.get_obs()
 
-                # handle key presses
+                # 处理按键事件
                 press_events = key_counter.get_press_events()
                 for key_stroke in press_events:
                     if key_stroke == KeyCode(char='q'):
-                        # Exit program
+                        # 退出程序
                         stop = True
                     elif key_stroke == KeyCode(char='c'):
-                        # Start recording
+                        # 开始录制
                         env.start_episode(t_start + (iter_idx + 2) * dt - time.monotonic() + time.time())
                         key_counter.clear()
                         is_recording = True
                         print('Recording!')
                     elif key_stroke == KeyCode(char='s'):
-                        # Stop recording
+                        # 停止录制
                         env.end_episode()
                         key_counter.clear()
                         is_recording = False
                         print('Stopped.')
                     elif key_stroke == Key.backspace:
-                        # Delete the most recent recorded episode
+                        # 删除最近一次录制
                         if click.confirm('Are you sure to drop an episode?'):
                             env.drop_episode()
                             key_counter.clear()
@@ -107,7 +109,7 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                         # delete
                 stage = key_counter[Key.space]
 
-                # visualize
+                # 可视化当前相机画面和状态
                 vis_img = obs[f'camera_{vis_camera_idx}'][-1,:,:,::-1].copy()
                 episode_id = env.replay_buffer.n_episodes
                 text = f'Episode: {episode_id}, Stage: {stage}'
@@ -127,27 +129,28 @@ def main(output, robot_ip, vis_camera_idx, init_joints, frequency, command_laten
                 cv2.pollKey()
 
                 precise_wait(t_sample)
-                # get teleop command
+                # 获取SpaceMouse的运动指令
                 sm_state = sm.get_motion_state_transformed()
                 # print(sm_state)
-                dpos = sm_state[:3] * (env.max_pos_speed / frequency)
-                drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)
+                dpos = sm_state[:3] * (env.max_pos_speed / frequency)  # 末端平移增量
+                drot_xyz = sm_state[3:] * (env.max_rot_speed / frequency)  # 末端旋转增量
                 
                 if not sm.is_button_pressed(0):
-                    # translation mode
+                    # 平移模式（未按下左键时，只允许平移，不允许旋转）
                     drot_xyz[:] = 0
                 else:
                     dpos[:] = 0
                 if not sm.is_button_pressed(1):
-                    # 2D translation mode
+                    # 2D平移模式，锁定z轴（未按下右键时，z轴平移为0）
                     dpos[2] = 0    
 
+                # 计算旋转
                 drot = st.Rotation.from_euler('xyz', drot_xyz)
                 target_pose[:3] += dpos
                 target_pose[3:] = (drot * st.Rotation.from_rotvec(
                     target_pose[3:])).as_rotvec()
 
-                # execute teleop command
+                # 执行遥操作命令
                 env.exec_actions(
                     actions=[target_pose], 
                     timestamps=[t_command_target-time.monotonic()+time.time()],
